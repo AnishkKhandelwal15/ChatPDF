@@ -36,7 +36,7 @@ export default async function Home() {
               </Link>
             )}
           </div>
-        </div>
+        </div>_
       </div>
     </div>
   );
