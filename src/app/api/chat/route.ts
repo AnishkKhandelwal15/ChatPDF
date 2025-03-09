@@ -8,13 +8,6 @@ import { Message } from "ai";
 
 export const runtime = "nodejs";
 
-const apiKey = process.env.GOOGLE_API_KEY;
-if (!apiKey) throw new Error("GOOGLE_API_KEY is not defined");
-
-console.log("GOOGLE_API_KEY is set:", !!apiKey);
-
-const genAI = new GoogleGenerativeAI(apiKey);
-
 interface ChatRequestBody {
   messages: Message[];
   chatId: number;
@@ -22,64 +15,87 @@ interface ChatRequestBody {
 
 export async function POST(req: Request): Promise<Response> {
   try {
-    const { messages, chatId } = await req.json() as ChatRequestBody;
+    const apiKey = process.env.GOOGLE_API_KEY;
+    if (!apiKey) return NextResponse.json({ error: "Missing GOOGLE_API_KEY" }, { status: 500 });
+    const genAI = new GoogleGenerativeAI(apiKey);
+
+    let body: ChatRequestBody;
+    try {
+      body = await req.json() as ChatRequestBody;
+    } catch (e) {
+      return NextResponse.json({ error: "Invalid request body" }, { status: 400 });
+    }
+    const { messages, chatId } = body;
+    if (!Array.isArray(messages) || !Number.isInteger(chatId)) {
+      return NextResponse.json({ error: "Invalid messages or chatId" }, { status: 400 });
+    }
+    if (!messages.length) return NextResponse.json({ error: "No messages provided" }, { status: 400 });
 
     console.log("Received chatId:", chatId);
     console.log("Received messages:", messages);
 
     const _chats = await db.select().from(chat).where(eq(chat.id, chatId));
-    console.log("Fetched chat details:", _chats);
-
-    if (_chats.length !== 1) {
+    if (_chats.length !== 1 || !_chats[0]) {
       console.error("Chat not found for chatId:", chatId);
       return NextResponse.json({ error: "Chat not found" }, { status: 404 });
     }
-
     const fileKey = _chats[0].fileKey;
+    if (!fileKey) return NextResponse.json({ error: "Chat missing fileKey" }, { status: 500 });
+
     const lastMessage = messages[messages.length - 1];
+    if (!lastMessage?.content) return NextResponse.json({ error: "Last message empty" }, { status: 400 });
     console.log("Last user message:", lastMessage);
 
     const context = await getContext(lastMessage.content, fileKey);
-    console.log("Retrieved context:", context);
+    console.log("Retrieved context:", context || "No context found");
 
     const systemPrompt = {
       role: "system",
       content: `AI assistant is a brand new, powerful, human-like artificial intelligence.
-      START CONTEXT BLOCK
-      ${context}
-      END OF CONTEXT BLOCK
-      If the context does not provide the answer, say, "I'm sorry, but I don't know the answer to that question."`,
+        START CONTEXT BLOCK
+        ${context || "No context available"}
+        END OF CONTEXT BLOCK
+        If the context does not provide the answer, say, "I'm sorry, but I don’t know the answer to that question."`,
     };
 
-    const userMessages = messages.filter((message: Message) => message.role === "user");
+    const userMessages = messages.filter((msg) => msg.role === "user");
     const combinedContent = [systemPrompt.content, ...userMessages.map((msg) => msg.content)].join("\n");
 
     console.log("Sending request to Gemini AI...");
-
     const model = genAI.getGenerativeModel({ model: "gemini-1.5-pro" });
-    const result = await model.generateContentStream(combinedContent);
+    let result;
+    try {
+      result = await model.generateContentStream(combinedContent);
+    } catch (e) {
+      console.error("Gemini API error:", e);
+      return NextResponse.json({ error: "AI service unavailable" }, { status: 503 });
+    }
 
     console.log("Streaming AI response...");
-
     const encoder = new TextEncoder();
     const stream = new ReadableStream({
       async start(controller) {
         let aiResponse = "";
         try {
           for await (const chunk of result.stream) {
-            const text = chunk.text?.() || "";
+            const text = typeof chunk.text === "function" ? chunk.text() : chunk.text || "";
             if (text) {
               console.log("AI Response Chunk:", text);
-              // Stream as JSON for useChat compatibility
               const jsonChunk = JSON.stringify({ role: "assistant", content: text }) + "\n";
               controller.enqueue(encoder.encode(jsonChunk));
               aiResponse += text;
+            } else {
+              console.warn("Empty chunk received");
             }
           }
-          await db.insert(_messages).values([
-            { chatId, content: lastMessage.content, role: "user" as const },
-            { chatId, content: aiResponse, role: "assistant" as const },
-          ]);
+          try {
+            await db.insert(_messages).values([
+              { chatId, content: lastMessage.content, role: "user" },
+              { chatId, content: aiResponse, role: "assistant" },
+            ]);
+          } catch (dbError) {
+            console.error("DB insert failed:", dbError);
+          }
           controller.close();
         } catch (streamError) {
           console.error("Stream error:", streamError);
@@ -89,12 +105,11 @@ export async function POST(req: Request): Promise<Response> {
     });
 
     return new Response(stream, {
-      headers: {
-        "Content-Type": "text/plain; charset=utf-8", // Still works with JSON chunks
-      },
+      headers: { "Content-Type": "application/x-ndjson" },
     });
   } catch (error) {
     console.error("Error in chat API:", error);
-    return NextResponse.json({ error: "Internal Server Error" }, { status: 500 });
+    const message = error instanceof Error ? error.message : "Unknown error";
+    return NextResponse.json({ error: message }, { status: 500 });
   }
 }
